@@ -28,7 +28,7 @@ Brix takes the safety and performance of Rust and improves on these fronts:
 14. **Operator overloading** - `op +`, `op ==` inside the struct - no trait names to remember
 15. **Unlimited pattern matching** - depth + guards - fully expressive
 16. **Python-style loops** - `range()`, `enumerate()` - familiar and clean
-17. **Solana-ready from day one** - `[on_chain]` effect, ownership contracts map to account model, compile-time account validation
+17. **Solana-ready from day one** - corrected `[on_chain]` effect, linear account types, role types, aliasing prevention via linear + distinct typed accounts
 
 ---
 
@@ -1135,14 +1135,29 @@ Effects declare what side effects a function is allowed to have. Effects are use
 
 ```brix
 // Built-in effects - defined in brix-core
-effect pure    { }
+effect pure          { }    // no side effects whatsoever - mathematical functions only
+effect deterministic { }    // no randomness, no system time, no floats, no syscalls
+                            // but CAN mutate state passed to it - unlike pure
 effect io      { fn read() -> [u8]; fn write(data: [u8]) -> (); }
 effect network { fn connect(url: String) -> Connection; }
 effect alloc   { fn allocate(size: i32) -> u64; }
 effect panic   { fn panic(msg: String) -> !; }
 effect global  { fn read_global() -> u64; fn write_global(val: u64) -> (); }
 
-// User-defined effects
+// Solana account IO - can ONLY interact with Solana accounts
+// NOT general IO - cannot touch files, network, or system
+effect account_io {
+    fn read_account(key: Pubkey) -> AccountData;
+    fn write_account(key: Pubkey, data: AccountData) -> ();
+}
+
+// on_chain = deterministic + account_io
+// Solana programs are NOT pure - they mutate accounts
+// They ARE deterministic - same inputs must produce same outputs
+// They can ONLY do account IO - no files, no network, no syscalls
+effect on_chain: deterministic + account_io { }
+
+// User-defined effects - anyone can define new ones in a package
 effect database {
     fn query(sql: String) -> [Row];
     fn execute(sql: String) -> i32;
@@ -1153,14 +1168,35 @@ effect cache {
     fn set(key: String, value: String) -> ();
 }
 
-// Effect inheritance - on_chain inherits pure's restrictions
-effect on_chain: pure {
-    fn get_account(key: Pubkey) -> Account;
-    fn set_account(key: Pubkey, data: [u8]) -> ();
-}
-
 // Combine effects
 effect web = io + network;
+```
+
+### Why `on_chain` is NOT `pure`
+
+This is a critical distinction:
+
+```brix
+// pure - cannot mutate ANY external state
+// A Solana program CANNOT be pure - it exists to mutate accounts
+[pure] fn add(a: i32, b: i32) -> i32 { a + b }    // fine - truly pure
+
+// on_chain = deterministic + account_io
+// CAN mutate accounts (that is its job)
+// CANNOT be non-deterministic
+// CANNOT do file IO, network, or syscalls
+[on_chain]
+fn transfer(
+    from: linear writable From,
+    to:   linear writable To,
+    amount: u64,
+) -> !() {
+    from.data.balance = from.data.balance - amount;  // fine - account_io
+    to.data.balance   = to.data.balance   + amount;  // fine - account_io
+    read_file("x")!;                                  // ERROR - not account_io
+    let r = random();                                  // ERROR - not deterministic
+    fetch("url")!;                                     // ERROR - not account_io
+}
 ```
 
 ### Applying effects
@@ -1169,11 +1205,12 @@ Effects are applied with `[ ]` - distinct from decorators `@` and keywords.
 
 ```brix
 [pure]             fn calculate(x: i32) -> i32 { x * 2 }
+[deterministic]    fn hash(data: [u8]) -> [u8; 32] { ... }
 [io]               fn save(path: String) -> !() { ... }
 [network]          fn fetch(url: String) -> !String { ... }
 [database]         fn get_user(id: i32) -> !User { ... }
 [database, cache]  fn get_user_cached(id: i32) -> !User { ... }
-[on_chain]         fn process_instruction(accounts: [Account]) -> !() { ... }
+[on_chain]         fn process_instruction(accounts: [RawAccount], data: [u8]) -> !() { ... }
 [web]              fn fetch_and_save(url: String) -> !() { ... }
 ```
 
@@ -1187,12 +1224,13 @@ Effects are applied with `[ ]` - distinct from decorators `@` and keywords.
     x * 2                          // fine
 }
 
-// on_chain - only pure operations allowed
+// on_chain - only deterministic + account_io allowed
 [on_chain]
-fn process_instruction(accounts: [Account]) -> !() {
-    let fee = calculate(1000);    // fine - pure
+fn process_instruction(accounts: [RawAccount], data: [u8]) -> !() {
+    let fee = calculate(1000);    // fine - pure implies deterministic
     read_file("x")!;              // ERROR - io not allowed in on_chain
     fetch("url")!;                // ERROR - network not allowed in on_chain
+    let r = random();             // ERROR - not deterministic
 }
 ```
 
@@ -1216,27 +1254,30 @@ pub [pure] fn bad(path: String) -> !String {
 ### The complete Brix function signature
 
 ```brix
-// decorators   effects         name          inputs                   output
-   @retry(3)   [network]       fn fetch      (url: owned String)   -> !String
-   @measure    [database]      fn get_user   (id: i32)             -> !User
-   @log        [io, network]   fn sync       (path: borrow String) -> !()
-               [pure]          fn add        (a: i32, b: i32)      -> i32
-               [on_chain]      fn transfer   (from: mut Account,
-                                              to: mut Account,
-                                              amount: u64)          -> !()
+// decorators   effects              name            inputs                    output
+   @retry(3)   [network]            fn fetch        (url: owned String)    -> !String
+   @measure    [database]           fn get_user     (id: i32)              -> !User
+   @log        [io, network]        fn sync         (path: borrow String)  -> !()
+               [pure]               fn add          (a: i32, b: i32)       -> i32
+               [deterministic]      fn hash         (data: [u8])           -> [u8; 32]
+               [on_chain]           fn transfer     (from: linear writable From,
+                                                     to:   linear writable To,
+                                                     amount: u64)          -> !()
 ```
 
 ### Built-in effects reference
 
-| Effect | Meaning |
-|--------|---------|
-| `pure` | No side effects - deterministic |
-| `io` | File system, stdin/stdout |
-| `network` | HTTP, TCP, network calls |
-| `alloc` | Heap memory allocation |
-| `panic` | Can panic at runtime |
-| `global` | Reads/writes global state |
-| `on_chain` | Solana on-chain context - only pure allowed |
+| Effect | Meaning | Solana programs |
+|--------|---------|----------------|
+| `pure` | No side effects - truly mathematical | No - they mutate accounts |
+| `deterministic` | Same inputs, same outputs - no randomness | Yes - required |
+| `io` | File system, stdin/stdout | No |
+| `network` | HTTP, TCP, network calls | No |
+| `alloc` | Heap memory allocation | Limited |
+| `panic` | Can panic at runtime | No |
+| `global` | Reads/writes global state | No |
+| `account_io` | Solana account read/write only | Yes - this is their job |
+| `on_chain` | `deterministic + account_io` | Yes - the correct model |
 
 ---
 
@@ -1565,23 +1606,239 @@ fn main() -> !() {
 ### Solana On-Chain Program
 
 ```brix
-use brix_solana::{ Account, Pubkey, ProgramResult };
+use brix_solana::{ RawAccount, Pubkey, TokenData };
 
+// Entry point - raw runtime array from Solana runtime
 [on_chain]
+fn process_instruction(
+    accounts: [RawAccount],
+    data: [u8],
+) -> !() {
+    // Bind accounts to typed roles - signer/writable verified here at runtime
+    // but guaranteed to happen - you cannot skip this
+    let (payer, from, to) = accounts.bind::<(
+        linear signer   Payer,
+        linear writable From,
+        linear writable To,
+    )>()?;
+
+    // Runtime checks that must stay runtime
+    // Validated wrapper - compiler ensures these run before data access
+    let from = from.require_owner(TOKEN_PROGRAM_ID)?;
+    let to   = to.require_owner(TOKEN_PROGRAM_ID)?;
+
+    // Parse instruction data
+    let amount: u64 = data.parse()?;
+
+    // Business logic - now statically safe
+    transfer(payer, from, to, amount)?;
+}
+
+// Typed business logic function
+// linear prevents same account being passed twice
+// From and To are distinct types - wrong order is a compile error
 fn transfer(
-    payer: owned signer Account,
-    from: mut token Account,
-    to: mut token Account,
+    payer: linear signer   Payer,
+    from:  linear writable ValidatedFrom,
+    to:    linear writable ValidatedTo,
     amount: u64,
 ) -> !() {
-    from.balance = from.balance - amount;
-    to.balance = to.balance + amount;
+    if from.data.balance < amount {
+        return Err(InsufficientFunds);
+    }
+    from.data.balance = from.data.balance - amount;
+    to.data.balance   = to.data.balance   + amount;
 }
 ```
 
 ---
 
-## 25. Unified CLI
+## 25. Solana Account Model
+
+Brix has a purpose-built account model for writing Solana on-chain programs. This section documents what Brix can and cannot guarantee at compile time, and how the type system helps catch real bugs.
+
+### What is and is not possible at compile time
+
+Solana account validation is inherently runtime-dependent. The compiler sees types - it does not see the Solana ledger.
+
+**Cannot be compile-time - must stay runtime:**
+- Account owner - which program owns this account is only known at runtime
+- PDA seeds - whether seeds produce the right address depends on runtime inputs
+- Signer bit - whether an account signed is a transaction-level runtime fact
+- Rent exemption - lamport balance is runtime state
+- Data layout correctness - whether bytes decode correctly is runtime data
+- Account aliasing identity - whether two pointers refer to the same account is runtime
+
+**Can be compile-time - what Brix enforces statically:**
+- Same account cannot be passed twice to a function (linear types)
+- Accounts cannot be used in the wrong role (role types)
+- Validation cannot be skipped - Validated wrapper enforced by type system
+- On-chain code cannot do IO, network, or randomness (effect system)
+- Data cannot be accessed before owner check (Validated type)
+- Account mutability is tracked - readonly accounts cannot be mutated
+
+### Linear Account Types
+
+`linear` is a special ownership concept for Solana accounts. A linear value moves on use - it cannot be copied, cloned, or passed twice. This prevents account aliasing at compile time.
+
+```brix
+fn transfer(
+    from: linear writable From,
+    to:   linear writable To,
+) -> !() { ... }
+
+let from = accounts[1];
+let to   = accounts[2];
+
+transfer(from, to);    // fine - each moved once
+transfer(from, from);  // ERROR - from already moved - compile error
+                       // catches double-spend bug statically
+```
+
+### Role Types
+
+Each account gets a distinct type encoding its role. Even if two accounts hold the same data type, their role types are different - preventing wrong-order bugs.
+
+```brix
+struct Payer { lamports: u64 }
+struct From  { data: TokenData }
+struct To    { data: TokenData }
+
+// From and To are different types even though both hold TokenData
+fn transfer(
+    payer: linear signer   Payer,
+    from:  linear writable From,
+    to:    linear writable To,
+) -> !() { ... }
+
+transfer(payer, from, to);    // fine
+transfer(payer, to, from);    // ERROR - From expected, got To - compile error
+                               // catches wrong account order statically
+```
+
+### Account Binding at Entry Point
+
+Accounts arrive as a flat runtime array. `bind()` assigns roles and verifies basic constraints (signer, writable) at runtime - but the compiler guarantees this step cannot be skipped.
+
+```brix
+[on_chain]
+fn process_instruction(
+    accounts: [RawAccount],
+    data: [u8],
+) -> !() {
+
+    // bind() - runtime verification but structurally required
+    // returns typed linear accounts or propagates error
+    let (payer, from, to) = accounts.bind::<(
+        linear signer   Payer,     // signer bit checked here at runtime
+        linear writable From,      // writable bit checked here at runtime
+        linear writable To,        // writable bit checked here at runtime
+    )>()?;
+
+    // After bind() - statically safe to proceed
+    transfer(payer, from, to)?;
+}
+```
+
+### Validated Wrapper - Mandatory Owner Checks
+
+Before accessing account data, the owner must be verified. The `Validated` wrapper type makes this structurally mandatory - the compiler prevents data access on unvalidated accounts.
+
+```brix
+// After bind() - account is Unvalidated
+// You cannot access .data on an Unvalidated account
+let from: Unvalidated<From> = ...;
+from.data.balance = ...;  // ERROR - cannot access data on Unvalidated account
+
+// After require_owner() - account becomes Validated
+// Only now can you access .data
+let from: Validated<From> = from.require_owner(TOKEN_PROGRAM_ID)?;
+from.data.balance = ...;  // fine - owner was verified
+
+// The full pattern
+let from = from.require_owner(TOKEN_PROGRAM_ID)?;  // runtime - but required
+let to   = to.require_owner(TOKEN_PROGRAM_ID)?;    // runtime - but required
+transfer(payer, from, to)?;
+```
+
+### The Full Pattern
+
+```brix
+[on_chain]
+fn process_instruction(
+    accounts: [RawAccount],
+    data: [u8],
+) -> !() {
+
+    // Step 1 - bind to typed roles (runtime, but structurally required)
+    let (payer, from, to) = accounts.bind::<(
+        linear signer   Payer,
+        linear writable From,
+        linear writable To,
+    )>()?;
+
+    // Step 2 - validate ownership (runtime, but structurally required)
+    let from = from.require_owner(TOKEN_PROGRAM_ID)?;
+    let to   = to.require_owner(TOKEN_PROGRAM_ID)?;
+
+    // Step 3 - parse instruction data
+    let amount: u64 = data.parse()?;
+
+    // Step 4 - business logic (statically safe from here)
+    transfer(payer, from, to, amount)?;
+}
+
+fn transfer(
+    payer: linear signer   Payer,
+    from:  linear writable Validated<From>,
+    to:    linear writable Validated<To>,
+    amount: u64,
+) -> !() {
+    if from.data.balance < amount {
+        return Err(InsufficientFunds);
+    }
+    from.data.balance = from.data.balance - amount;
+    to.data.balance   = to.data.balance   + amount;
+}
+```
+
+### What Brix Catches vs What Rust + Anchor Catches
+
+| Bug class | Rust + Anchor | Brix |
+|-----------|--------------|------|
+| Same account passed twice | Runtime panic | Compile error (linear types) |
+| Wrong account order | Silent corruption | Compile error (role types) |
+| Forgot signer check | Runtime exploit | bind() structurally required |
+| Forgot writable check | Runtime exploit | bind() structurally required |
+| Accessing data before owner check | Silent bug | Compile error (Validated wrapper) |
+| IO in on-chain code | Runtime failure | Compile error (`[on_chain]` effect) |
+| Randomness in on-chain code | Runtime failure | Compile error (`[deterministic]`) |
+| Reentrancy via CPI | Runtime exploit | Linear types prevent mutable aliasing |
+
+### What Brix Cannot Catch
+
+Being honest about what remains runtime:
+
+- PDA seed correctness - depends on runtime inputs
+- Rent exemption - lamport balance is runtime state
+- Account data layout beyond the declared struct - runtime data
+- Cross-program account ownership chains - runtime ledger state
+- Any check that requires reading the Solana ledger - runtime
+
+### Honest Positioning
+
+Brix does not eliminate runtime validation for Solana. It eliminates the class of bugs that come from:
+- Forgetting to validate
+- Validating in the wrong order
+- Accidentally aliasing accounts
+- Using accounts in the wrong role
+- Writing non-deterministic on-chain code
+
+The remaining runtime checks are made structurally mandatory - you cannot skip them because the type system will not let you access account data without going through the validation wrapper.
+
+---
+
+## 26. Unified CLI
 
 ```bash
 brix new my-project       # create a new project
@@ -1621,7 +1878,7 @@ json = "0.8.1"
 
 ---
 
-## 26. Built-in Formatter
+## 27. Built-in Formatter
 
 `brix fmt` - one official style, non-configurable.
 
@@ -1646,7 +1903,7 @@ fn add(a: i32, b: i32) -> i32 {
 
 ---
 
-## 27. What Brix Removes from Rust
+## 28. What Brix Removes from Rust
 
 | Rust feature | Brix approach |
 |-------------|--------------|
@@ -1673,7 +1930,11 @@ fn add(a: i32, b: i32) -> i32 {
 | `String::from("...")` | String literals are owned by default |
 | No effect system | User-defined effects `[pure]`, `[io]`, `[network]` |
 | No decorator system | `@decorator` with full lifecycle hooks |
-| No on-chain safety | `[on_chain]` effect - compiler enforces determinism |
+| No on-chain safety | `[on_chain]` = `deterministic + account_io` - semantically correct |
+| `on_chain: pure` confusion | Solana programs mutate accounts - `pure` was wrong - fixed to `deterministic + account_io` |
+| Account aliasing (runtime panic) | Linear types - same account twice is a compile error |
+| Wrong account order (silent bug) | Role types - From and To are distinct types |
+| Skippable validation (runtime exploit) | Validated wrapper - compiler enforces validation before data access |
 | `for i in 0..n` range syntax | Python-style `range(n)`, `enumerate()` |
 | No cross-cutting concern tools | `@log`, `@retry`, `@cache`, `@measure` |
 | Uninitialized variables undefined | Compiler tracks definite assignment |
